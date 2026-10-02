@@ -29,12 +29,22 @@
         Vector3 position, not a CFrame. The old matcher therefore never fired,
         so knife silent aim silently did nothing.
       * knifeRemote() now matches any RemoteEvent inside the local Knife tool
-        plus the known names ("Throw"/"KnifeThrown"/...), and never the Gun
-        remote.
+        plus the known names ("Throw"/"KnifeThrown"/...) and any name that
+        contains "throw"/"knife", and never the Gun remote.
       * redirect()'s knife branch now accepts a Vector3 OR CFrame destination
         and preserves its original type, and derives the origin from either a
         Vector3 or a CFrame first argument (no more args[1].Position crash).
-      * Gun silent aim and the Shoot Murder button are unchanged.
+
+    v4.3 -- REGRESSION REVERT (gun + Shoot button restored):
+      * v4.2 also added "Throw" to findGunRemote()'s ignore list. When the Gun
+        tool's own remote is named "Throw", that made findGunRemote() return
+        nil, so the Shoot Murder button stopped firing and passive gun silent
+        aim stopped working. That change has been fully reverted.
+      * The gun matcher (shotRemote), the gun branch of redirect() and the
+        Shoot Murder button (fireGunAt/findGunRemote) are now byte-for-byte
+        the original working versions.
+      * knifeRemote() additionally hard-excludes the local Gun tool's remotes,
+        so the knife matcher can never hijack a gun shot.
 =======================================================================]]
 
 --============================================================ SERVICES
@@ -1949,22 +1959,26 @@ local KNIFE_REMOTE_NAMES = {
 function knifeRemote(remote, args)
     if not config.knifeEnabled or args.n < 2 then return false end
     if typeof(remote) ~= "Instance" or not remote:IsA("RemoteEvent") then return false end
-    -- Never hijack the gun shot remote; that path is handled separately.
-    local tool = remote:FindFirstAncestorOfClass("Tool")
-    if tool and tool.Name == "Gun" then return false end
     local character = LocalPlayer.Character
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local knife = (character and character:FindFirstChild("Knife")) or (backpack and backpack:FindFirstChild("Knife"))
+    local gun = (character and character:FindFirstChild("Gun")) or (backpack and backpack:FindFirstChild("Gun"))
+    -- Absolutely never touch the local gun's remotes; the gun path is separate.
+    if gun and remote:IsDescendantOf(gun) then return false end
+    local tool = remote:FindFirstAncestorOfClass("Tool")
+    if tool and tool.Name == "Gun" then return false end
     -- Primary, version-proof match: the throw remote lives inside the local
     -- Knife tool (Workspace.<LocalPlayer>.Knife.Events.<remote>).
-    local knife = (character and character:FindFirstChild("Knife")) or (backpack and backpack:FindFirstChild("Knife"))
     if knife and remote:IsDescendantOf(knife) then return true end
     if tool and tool.Name == "Knife" then return true end
-    -- Secondary: a known knife remote name, but only while we actually own a
-    -- knife, so unrelated remotes are never rewritten.
-    if KNIFE_REMOTE_NAMES[remote.Name] then
-        if knife then return true end
-        if character and remote:IsDescendantOf(character) then return true end
-        if backpack and remote:IsDescendantOf(backpack) then return true end
+    -- Secondary: a known knife remote name while we actually own a knife. The
+    -- murderer never carries a Gun, so this can never collide with the gun path.
+    if knife and KNIFE_REMOTE_NAMES[remote.Name] then return true end
+    -- Tertiary: any remote whose name mentions the throw/knife action while we
+    -- actually own a Knife, so client builds we have not hard-coded still work.
+    if knife then
+        local lower = string.lower(remote.Name)
+        if string.find(lower, "throw", 1, true) or string.find(lower, "knife", 1, true) then return true end
     end
     return false
 end
@@ -2001,11 +2015,18 @@ function shotRemote(remote, args)
     -- shot pair. Keep unrelated trailing arguments untouched.
     return firstIsPos and secondIsPos
 end
-local function fallbackGunOrigin()
-    local gun = localGunTool()
-    local handle = gun and gun:FindFirstChild("Handle", true)
-    if handle and handle:IsA("BasePart") then return handle.Position end
+local function fallbackOrigin()
+    -- Used only when the fired call's first argument is not itself a position.
+    -- Prefer the knife handle (knife throws), then the gun handle, then the head.
     local character = LocalPlayer.Character
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local knife = (character and character:FindFirstChild("Knife")) or (backpack and backpack:FindFirstChild("Knife"))
+    local gun = localGunTool()
+    local handle = knife and knife:FindFirstChild("Handle", true)
+    if not (handle and handle:IsA("BasePart")) then
+        handle = gun and gun:FindFirstChild("Handle", true)
+    end
+    if handle and handle:IsA("BasePart") then return handle.Position end
     local root = character and (character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart"))
     return root and root.Position or nil
 end
@@ -2046,7 +2067,7 @@ function redirect(remote, args)
     -- well-formed throw aimed at the target.
     if isKnife then
         local firstType, secondType = typeof(args[1]), typeof(args[2])
-        local origin = vectorOrCFramePosition(args[1]) or fallbackGunOrigin()
+        local origin = vectorOrCFramePosition(args[1]) or fallbackOrigin()
         if not origin then return end
         local aim = calculateKnifeAim(part, origin)
         if firstType == "CFrame" and config.alignDirection and (aim - origin).Magnitude > 0.01 then
@@ -2155,7 +2176,7 @@ function findGunRemote()
             local name=object.Name
             local score=#name
             if name=="Shoot" then score+=50 end
-            if name=="GunFired" or name=="KnifeThrown" or name=="Throw" then score=-1 end
+            if name=="GunFired" or name=="KnifeThrown" then score=-1 end
             if score>=(bestScore or 0) then best,bestScore=object,score end
         end
     end
