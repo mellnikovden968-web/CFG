@@ -5,7 +5,385 @@ local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 -- загружаем модуль
-local AutoParry = loadstring(readfile("чистый скрипт/BladeBall_AutoParry_Rise.lua"))()
+local AutoParry = (function()
+-- autoparry.lua | deobfuscated from stage_5.lua (Rise / Blade Ball)
+-- Connect-ready module: require() it from your script, then :Start()
+-- Exposes: AutoParry (signed remote fire + target/whitelist trigger + distance window)
+--           AntiKick (namecall hook that swallows :Kick on LocalPlayer)
+-- Source notes (deobf): fireParry/fireSpamParry -> rem:FireServer(signHash, signKey, s1(signKey), parryArgs(parryPayload(crv)))
+--   signer injected via rawget table: signHolder/signKey/sgn/s1/signHash/rem/byname(name). trigger: ball target attr + CollisionWhitelist.
+--   window: dist <= parryWindow(speed), far reject dist > window*2.5, per-ball 0.2s + global 0.06s throttle, max 7 fires / 0.5s.
+--   antikick [123]: guarded once-flag closure calling LocalPlayer:Kick(msg) x9 loop. No __namecall guard in source, so we add one.
+
+local AutoParry = {}
+AutoParry.__index = AutoParry
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+export type AutoParryOptions = {
+	Signer: any?, -- signer table the host script injects (has rem/sgn/signHolder/signHash/signKey/s1/byname/ensure)
+	ParryPayload: ((curve: any) -> any)?, -- builds payload from current curve value
+	ParryArgs: ((payload: any) -> any)?, -- wraps payload into final remote arg
+	ParryFallback: (() -> ())?, -- keyparry fallback (plays grab anim / virtual input)
+	AnyParry: (() -> boolean)?, -- gate: parry available (cooldowns/ability states)
+	IsAlive: (() -> boolean)?, -- gate: character alive
+	KeyParry: (() -> ())?, -- optional key-based parry path (preferred when set)
+	CurveValue: (() -> any)?, -- current curveaim value fed into ParryPayload
+	MaxFiresPerWindow: number?, -- default 7 per 0.5s (matches source throttle)
+	ExtraWindow: number?, -- added studs on top of ParryWindow(speed)
+	MinDelay: number?, -- global refire floor, default 0.06
+	PerBallDelay: number?, -- per-ball refire floor, default 0.2
+	ParryWindow: ((speed: number) -> number)?, -- distance window from ball speed; default speed/12 clamped
+	GetBall: (() -> Instance?)?, -- override ball picker (default: Balls folder, closest live ball)
+	AutoSpam: boolean?, -- spam Fire() on interval while on (deobf autospam/spamTick)
+	SpamInterval: number?, -- seconds between spam fires, default 0.05
+	ManualSpamKey: Enum.KeyCode?, -- E-toggle for manual spam (deobf manspam [5958]), default E
+	Enabled: boolean?,
+}
+
+local function defaultParryWindow(speed: number): number
+	-- deobf of parryWindow usage: window grows with speed; source clamps via math.clamp elsewhere.
+	-- Tuned so 100 speed ~= 8 studs, 600 speed ~= 50 studs, never below 6.
+	return math.clamp(speed / 12, 6, 60)
+end
+
+function AutoParry.new(opts: AutoParryOptions?): AutoParry
+	local self = setmetatable({}, AutoParry)
+	opts = opts or ({} :: any)
+	self.Enabled = if (opts :: any).Enabled == nil then true else (opts :: any).Enabled
+	self.Signer = (opts :: any).Signer
+	self.ParryPayload = (opts :: any).ParryPayload
+	self.ParryArgs = (opts :: any).ParryArgs
+	self.ParryFallback = (opts :: any).ParryFallback
+	self.AnyParry = (opts :: any).AnyParry or function() return true end
+	self.IsAlive = (opts :: any).IsAlive or function()
+		local c = LocalPlayer.Character
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		return h ~= nil and h.Health > 0
+	end
+	self.KeyParry = (opts :: any).KeyParry
+	self.CurveValue = (opts :: any).CurveValue or function() return 0 end
+	self.MaxFires = (opts :: any).MaxFiresPerWindow or 7
+	self.ExtraWindow = (opts :: any).ExtraWindow or 0
+	self.MinDelay = (opts :: any).MinDelay or 0.06
+	self.PerBallDelay = (opts :: any).PerBallDelay or 0.2
+	self.ParryWindowFn = (opts :: any).ParryWindow or defaultParryWindow
+	self.GetBallOverride = (opts :: any).GetBall
+	-- AutoSpam (deobf: autospam flag + spamTick caller [13993], manspam E-toggle [5958], gate [14246]):
+	-- source spamTick body is VM-buried, honest shape = repeat Fire() on a tight loop
+	-- while the spam flag is on. Same signed FireServer path, same 7-per-0.5s cap.
+	self.AutoSpam = (opts :: any).AutoSpam or false
+	self.SpamInterval = (opts :: any).SpamInterval or 0.05
+	self.ManualSpamKey = (opts :: any).ManualSpamKey -- Enum.KeyCode, default E like source
+	self._spamOn = false
+	self._spamThread = nil
+	self._fires = 0
+	self._lastFire = 0
+	self._ballState = {} :: { [Instance]: { lastParry: number, parried: boolean } }
+	self._conns = {}
+	self._running = false
+	return (self :: any)
+end
+
+function AutoParry.SetSigner(self: AutoParry, signer: any)
+	-- signer shape (from source): { rem: RemoteEvent, sgn: fn, s1: fn, signHolder: {}, signHash: string(36), signKey: fn->string, byname: fn, ensure: fn? }
+	self.Signer = signer
+end
+
+function AutoParry._decFire(self: AutoParry)
+	self._fires = math.max(0, self._fires - 1)
+end
+
+-- Real extracted fire path (deobfuscated fireParry, [14361]):
+--   if keyparry -> keyparry()
+--   elseif rem+sgn+holder+hash -> rem:FireServer(signHash, signKey(), s1(signKey()), parryArgs(parryPayload(crv)))
+--   else -> ensure(); parryfallback(); return false
+--   throttle: max 7 fires per 0.5s sliding window
+function AutoParry.Fire(self: AutoParry): boolean
+	if not (self.AnyParry :: any)() then return false end
+	if not (self.IsAlive :: any)() then return false end
+	if self.KeyParry then
+		(self.KeyParry :: any)()
+	elseif self.Signer and (self.Signer :: any).rem and (self.Signer :: any).sgn
+		and (self.Signer :: any).signHolder and (self.Signer :: any).signHash then
+		local s = self.Signer :: any
+		if not self.ParryPayload or not self.ParryArgs then
+			if s.ensure then s.ensure() end
+			if self.ParryFallback then (self.ParryFallback :: any)() end
+			return false
+		end
+		local payload = (self.ParryPayload :: any)((self.CurveValue :: any)())
+		local key = (s.signKey :: any)()
+		local sig = key and (s.s1 :: any)(key)
+		if not sig then
+			if self.ParryFallback then (self.ParryFallback :: any)() end
+			return false
+		end
+		(s.rem :: RemoteEvent):FireServer(s.signHash, key, sig, (self.ParryArgs :: any)(payload));
+	else
+		local s = (self.Signer :: any)
+		if s and s.ensure then s.ensure() end
+		if self.ParryFallback then (self.ParryFallback :: any)() end
+		return false
+	end
+	if self._fires >= self.MaxFires then return false end
+	self._fires += 1
+	task.delay(0.5, function() self:_decFire() end)
+	return true
+end
+
+-- Spam variant (deobfuscated fireSpamParry, [12992]): identical fire, no sessparry counter.
+function AutoParry.FireSpam(self: AutoParry): boolean
+	return (self :: any):Fire()
+end
+
+local function ballSpeed(ball: Instance): number
+	local z = ball:FindFirstChild("zoomies")
+	if z and z:IsA("VectorVelocity") then return z.VectorVelocity.Magnitude end
+	local a = ball:GetAttribute("Velocity")
+	if typeof(a) == "Vector3" then return (a :: Vector3).Magnitude end
+	local b = ball:FindFirstChild("Body")
+	if b and b:IsA("BasePart") then return b.AssemblyLinearVelocity.Magnitude end
+	if ball:IsA("BasePart") then return ball.AssemblyLinearVelocity.Magnitude end
+	return 0
+end
+
+local function ballPos(ball: Instance): Vector3?
+	if ball:IsA("BasePart") then return ball.Position end
+	local b = ball:FindFirstChild("Body")
+	if b and b:IsA("BasePart") then return b.Position end
+	return nil
+end
+
+local function ballTarget(ball: Instance): string?
+	local t = ball:GetAttribute("target")
+	if typeof(t) == "string" then return t end
+	return nil
+end
+
+function AutoParry._pickBall(self: AutoParry): Instance?
+	if self.GetBallOverride then return (self.GetBallOverride :: any)() end
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+	local folder = workspace:FindFirstChild("Balls")
+	if not folder then return nil end
+	local best: Instance? = nil
+	local bestD = math.huge
+	for _, b in ipairs(folder:GetChildren()) do
+		if b:IsA("BasePart") and b.Parent ~= nil then
+			local p = ballPos(b)
+			if p then
+				local d = ((hrp :: BasePart).Position - p).Magnitude
+				if d < bestD then bestD = d; best = b end
+			end
+		end
+	end
+	return best
+end
+
+function AutoParry._state(self: AutoParry, ball: Instance)
+	local st = self._ballState[ball]
+	if not st then
+		st = { lastParry = 0, parried = false }
+		self._ballState[ball] = st
+	end
+	return st
+end
+
+-- Real extracted trigger (deobfuscated [8123] autoparry loop):
+--   hook per-ball: target attr change resets parried; whitelist change resets parried
+--   only when target == LocalPlayer.Name and not parried:
+--     dist = |hrp - ball|, window = parryWindow(speed)
+--     reject if dist > window*2.5; fire if dist <= window, per-ball 0.2s, global 0.06s
+function AutoParry._tryBall(self: AutoParry, ball: Instance)
+	if not self.Enabled then return end
+	local char = LocalPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+	local pos = ballPos(ball)
+	if not pos then return end
+	if ballTarget(ball) ~= LocalPlayer.Name then return end
+	local st = self:_state(ball)
+	if st.parried then return end
+	local speed = ballSpeed(ball)
+	local now = os.clock()
+	if now - st.lastParry <= self.PerBallDelay then return end
+	if now - self._lastFire <= self.MinDelay then return end
+	local window = (self.ParryWindowFn :: any)(speed) + self.ExtraWindow
+	local dist = ((hrp :: BasePart).Position - pos).Magnitude
+	if dist > window * 2.5 then return end
+	if dist <= window then
+		if (self :: any):Fire() then
+			self._lastFire = now
+			st.lastParry = now
+			st.parried = true
+			task.delay(0.6, function() st.parried = false end)
+		end
+	end
+end
+
+function AutoParry._hookBall(self: AutoParry, ball: Instance)
+	if self._ballState[ball] and (self._ballState[ball] :: any).hooked then return end
+	local st = self:_state(ball)
+	if (st :: any).hooked then return end
+	(st :: any).hooked = true
+	local conns = {}
+	conns[#conns + 1] = ball:GetAttributeChangedSignal("target"):Connect(function()
+		st.parried = false
+		self:_tryBall(ball)
+	end)
+	local function hookWL(wl: Instance?)
+		if wl and wl:IsA("ObjectValue") then
+			conns[#conns + 1] = (wl :: ObjectValue).Changed:Connect(function()
+				st.parried = false
+				self:_tryBall(ball)
+			end)
+		end
+	end
+	hookWL(ball:FindFirstChild("CollisionWhitelist"))
+	conns[#conns + 1] = ball.ChildAdded:Connect(function(c)
+		if c.Name == "CollisionWhitelist" then hookWL(c); self:_tryBall(ball) end
+	end)
+	conns[#conns + 1] = ball.Destroying:Once(function()
+		for _, c in ipairs(conns) do c:Disconnect() end
+		self._ballState[ball] = nil
+	end)
+	(st :: any).conns = conns
+end
+
+function AutoParry.Start(self: AutoParry)
+	if self._running then return end
+	self._running = true
+	-- heartbeat poll (source runs the [8123] body on a loop; Heartbeat kept as the poll clock)
+	self._conns[#self._conns + 1] = RunService.Heartbeat:Connect(function()
+		if not self.Enabled then return end
+		local folder = workspace:FindFirstChild("Balls")
+		if folder then
+			for _, b in ipairs(folder:GetChildren()) do
+				if b:IsA("BasePart") then
+					self:_hookBall(b)
+					self:_tryBall(b)
+				end
+			end
+		end
+		local tb = workspace:FindFirstChild("TrainingBalls")
+		if tb then
+			for _, b in ipairs(tb:GetChildren()) do
+				if b:IsA("BasePart") then
+					self:_hookBall(b)
+					self:_tryBall(b)
+				end
+			end
+		end
+	end)
+	-- manspam E-toggle (deobf [5958]): E flips manual spam loop on/off
+	local uis = game:GetService("UserInputService")
+	local key = self.ManualSpamKey or Enum.KeyCode.E
+	self._conns[#self._conns + 1] = uis.InputBegan:Connect(function(input, gpe)
+		if gpe then return end
+		if input.KeyCode == key then
+			(self :: any):ToggleSpam()
+		end
+	end)
+	if self.AutoSpam then
+		(self :: any):StartSpam()
+	end
+end
+
+function AutoParry.Stop(self: AutoParry)
+	self._running = false
+	(self :: any):StopSpam()
+	for _, c in ipairs(self._conns) do c:Disconnect() end
+	table.clear(self._conns)
+end
+
+-- AutoSpam: tight repeat-Fire loop over the same signed path.
+-- Mirrors source: autospam flag drives spamTick [13993], E toggles manspam [5958],
+-- anyparry gate [14246] stays inside Fire(). The 7-per-0.5s cap inside Fire() is the limiter.
+function AutoParry.SetSpam(self: AutoParry, on: boolean)
+	self.AutoSpam = on and true or false
+	if on then
+		(self :: any):StartSpam()
+	else
+		(self :: any):StopSpam()
+	end
+end
+
+function AutoParry.StartSpam(self: AutoParry)
+	if self._spamOn then return end
+	self._spamOn = true
+	self._spamThread = task.spawn(function()
+		while self._spamOn do
+			if self.Enabled and self.AutoSpam then
+				(self :: any):FireSpam()
+			end
+			task.wait(self.SpamInterval)
+		end
+	end)
+end
+
+function AutoParry.StopSpam(self: AutoParry)
+	self._spamOn = false
+end
+
+function AutoParry.ToggleSpam(self: AutoParry): boolean
+	(self :: any):SetSpam(not self.AutoSpam)
+	return self.AutoSpam
+end
+
+-- Real extracted anti-kick (deobfuscated [123]):
+--   source: once-flag closure -> LocalPlayer:Kick(msg); then 8 more :Kick in task.spawn loop.
+--   AntiKick here hooks __namecall and swallows any :Kick aimed at LocalPlayer BEFORE it lands.
+--   Returns the hook connection handle + disconnect fn. Safe to call once.
+local _antiKickHook: any = nil
+local _antiKickFired = false
+
+function AutoParry.EnableAntiKick(onKickBlocked: ((msg: string?) -> ())?): () -> ()
+	if _antiKickHook then
+		return function() end -- already armed
+	end
+	local mt = getrawmetatable(game) :: any
+	local oldNC = mt.__namecall
+	setreadonly(mt, false)
+	_antiKickHook = newcclosure(function(self: any, ...)
+		local method = getnamecallmethod()
+		if method == "Kick" then
+			local args = table.pack(...)
+			-- only swallow kicks aimed at us (LocalPlayer or its Character)
+			if self == LocalPlayer or (LocalPlayer.Character and self == LocalPlayer.Character) then
+				_antiKickFired = true -- mirrors source once-flag i[1][7][i[1][6]]
+				if onKickBlocked then
+					task.spawn(onKickBlocked, if args.n > 0 then tostring(args[1]) else nil)
+				end
+				return nil -- swallow all 9 kicks from the [123] loop
+			end
+		end
+		return oldNC(self, ...)
+	end)
+	mt.__namecall = _antiKickHook
+	setreadonly(mt, true)
+	return function()
+		if _antiKickHook then
+			local m2 = getrawmetatable(game) :: any
+			setreadonly(m2, false)
+			m2.__namecall = oldNC
+			setreadonly(m2, true)
+			_antiKickHook = nil
+		end
+	end
+end
+
+function AutoParry.WasKickBlocked(): boolean
+	return _antiKickFired
+end
+
+return AutoParry
+
+return AutoParry
+end)()
 -- если readfile не доступен, то как модуль уже в памяти
 if not AutoParry then error("AutoParry_Rise.lua не найден") end
 
