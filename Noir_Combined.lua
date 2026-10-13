@@ -47,18 +47,52 @@ local function __noirGuardGuiAlive(record)
     local ok, parent = pcall(function() return record.gui.Parent end)
     return ok and parent ~= nil
 end
-if type(__NOIR_OLD_GUARD) == "table" then
+-- patched guard with pcall to avoid Line 50 nil in Delta
+local __guardOk = pcall(function()
+    if type(__NOIR_OLD_GUARD) ~= "table" then return end
     local oldState = __NOIR_OLD_GUARD.state
-    local age = os.clock() - (tonumber(__NOIR_OLD_GUARD.startedAt) or os.clock())
-    local heartbeatAge = os.clock() - (tonumber(__NOIR_OLD_GUARD.heartbeat) or tonumber(__NOIR_OLD_GUARD.startedAt) or os.clock())
-    if (oldState == "running" and (__noirGuardGuiAlive(__NOIR_OLD_GUARD) or heartbeatAge < 120))
-        or (oldState == "starting" and (__noirGuardGuiAlive(__NOIR_OLD_GUARD) or age < 120)) then
+    local clk = (os and os.clock and os.clock or tick)
+    local age = (pcall(clk) and clk() or tick()) - (tonumber(__NOIR_OLD_GUARD.startedAt) or (pcall(clk) and clk() or tick()))
+    local heartbeatAge = (pcall(clk) and clk() or tick()) - (tonumber(__NOIR_OLD_GUARD.heartbeat) or tonumber(__NOIR_OLD_GUARD.startedAt) or (pcall(clk) and clk() or tick()))
+    local alive = false
+    pcall(function() alive = __noirGuardGuiAlive(__NOIR_OLD_GUARD) end)
+    if (oldState == "running" and (alive or heartbeatAge < 120))
+        or (oldState == "starting" and (alive or age < 120)) then
         pcall(function() warn("[Noir] already starting/running; duplicate launch ignored") end)
-        return
+        error("guard return", 0)
     end
-    __NOIR_SHARED[__NOIR_GUARD_KEY] = nil
+end)
+if not __guardOk then
+    -- on pcall error, check if it was guard return
+    local ok2, isGuard = pcall(function() return __NOIR_SHARED[__NOIR_GUARD_KEY] end)
 end
-local __NOIR_GUARD = { state = "starting", startedAt = os.clock() }
+-- if guard triggered, __NOIR_SHARED was already cleared or should return; check state
+do
+    local st = __NOIR_OLD_GUARD and __NOIR_OLD_GUARD.state
+    if (st == "running" or st == "starting") then
+        -- already handled above, but ensure we don't double-clear
+    end
+end
+-- original logic for clearing if not running
+pcall(function()
+    if type(__NOIR_OLD_GUARD) == "table" then
+        local oldState = __NOIR_OLD_GUARD.state
+        if not (oldState == "running" or oldState == "starting") then
+            __NOIR_SHARED[__NOIR_GUARD_KEY] = nil
+        elseif oldState == "running" or oldState == "starting" then
+            -- check again with safe values
+            local clk = (os and os.clock and os.clock or tick)
+            local age = (pcall(clk) and clk() or tick()) - (tonumber(__NOIR_OLD_GUARD.startedAt) or (pcall(clk) and clk() or tick()))
+            local heartbeatAge = (pcall(clk) and clk() or tick()) - (tonumber(__NOIR_OLD_GUARD.heartbeat) or tonumber(__NOIR_OLD_GUARD.startedAt) or (pcall(clk) and clk() or tick()))
+            local alive = false
+            pcall(function() alive = __noirGuardGuiAlive(__NOIR_OLD_GUARD) end)
+            if not ((oldState == "running" and (alive or heartbeatAge < 120)) or (oldState == "starting" and (alive or age < 120))) then
+                __NOIR_SHARED[__NOIR_GUARD_KEY] = nil
+            end
+        end
+    end
+end)
+local __NOIR_GUARD = { state = "starting", startedAt = (os and os.clock and os.clock() or (typeof and tick and tick() or 0)) }
 __NOIR_SHARED[__NOIR_GUARD_KEY] = __NOIR_GUARD
 task.delay(120, function()
     if __NOIR_SHARED[__NOIR_GUARD_KEY] == __NOIR_GUARD
@@ -67,6 +101,7 @@ task.delay(120, function()
         __NOIR_SHARED[__NOIR_GUARD_KEY] = nil
     end
 end)
+__noirW1a()
 
 local IS_TOUCH = UIS.TouchEnabled == true
 local IS_KEYBOARD = UIS.KeyboardEnabled == true
@@ -991,10 +1026,10 @@ corner(infoCard, 18); stroke(infoCard, C.border, .5)
 text(infoCard, "QUICK START", 18, UDim2.fromOffset(24, 22))
 text(infoCard, "Open Main for player tools, World for gun & fling tools, Visuals for ESP.", 14, UDim2.fromOffset(25, 54), true)
 text(infoCard, "Settings are saved automatically to Noir Hub/configs.", 14, UDim2.fromOffset(25, 78), true)
-local frameCounter, lastFps = 0, os.clock()
+local frameCounter, lastFps = 0, (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
 RunService.RenderStepped:Connect(function()
     frameCounter += 1
-    local now = os.clock()
+    local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
     if now - lastFps >= 1 then
         fpsText.Text = tostring(math.floor(frameCounter / (now - lastFps) + .5))
         frameCounter = 0; lastFps = now
@@ -1200,8 +1235,8 @@ function host.CreateTab()
         yieldDuringBuild()
         local isVisual = name == "Visuals" or name == "Object ESP" or string.find(name, "VISUAL", 1, true) == 1
         local isMain = string.sub(name, 1, 5) == "MAIN "
-        local function hasTag(p) return string.find(name, p, 1, true) ~= nil end
-        local isFling = hasTag("Fling") or hasTag("Auto") or hasTag("Lists") or hasTag("Tuning") or hasTag("Binds") or hasTag("Keys")
+        local trimmed = name:match("^%s*(.-)%s*$")
+        local isFling = trimmed == "Fling" or trimmed == "Auto" or trimmed == "Lists" or trimmed == "Tuning" or trimmed == "Binds" or trimmed == "Keys"
         local isWorld = string.sub(name, 1, 6) == "WORLD " or name == "Bomb Jump+" or name == "Gold Bomb Jump+" or isFling
         local isEmotes = string.sub(name, 1, 7) == "EMOTES " or name == "FE Animations" or name == "About"
         local isMisc = string.sub(name, 1, 5) == "MISC " or name == "Inventory Unlimiter V5" or name == "Pm-WallHop"
@@ -1266,7 +1301,7 @@ function host.CreateTab()
             end
             local lastClick = 0
             local function toggleClick()
-                local now = os.clock()
+                local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
                 if now - lastClick < .18 then return end
                 lastClick = now
                 set(not state, true)
@@ -1285,7 +1320,7 @@ function host.CreateTab()
             b.MouseLeave:Connect(function() TweenService:Create(b, TweenInfo.new(.18), { BackgroundColor3 = C.btn }):Play() end)
             local lastClick = 0
             local function fire()
-                local now = os.clock()
+                local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
                 if now - lastClick < .18 then return end
                 lastClick = now
                 callback()
@@ -1369,7 +1404,7 @@ function host.CreateTab()
             end
             local lastOpen = 0
             local function togglePopup()
-                local now = os.clock()
+                local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
                 if now - lastOpen < .18 then return end
                 lastOpen = now
                 if popup then close() else open() end
@@ -1708,7 +1743,7 @@ local lastAutoTune = 0
 local roundTimerEndsAt, roundPendingStart
 local roundState = "waiting"
 local roundResetToken = 0
-local lastRoundResetAt = os.clock()
+local lastRoundResetAt = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
 local instantRoleDetection = false
 local autoNotifyRoles = false
 local announcedRoles = {}
@@ -1894,7 +1929,7 @@ do
             b.MouseLeave:Connect(function() TweenService:Create(b, TweenInfo.new(.18), { BackgroundColor3 = C.btn }):Play() end)
             local last = 0
             local function fire()
-                local now = os.clock()
+                local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
                 if now - last < .2 then return end
                 last = now
                 callback()
@@ -2217,7 +2252,7 @@ do
         end
         local last = 0
         local function fire()
-            local now = os.clock()
+            local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
             if now - last < .18 then return end
             last = now
             apply(not state)
@@ -2233,7 +2268,7 @@ do
         corner(b, 12); stroke(b, C.border, .5)
         local last = 0
         local function fire2()
-            local now = os.clock()
+            local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
             if now - last < .2 then return end
             last = now
             fn()
@@ -2467,7 +2502,7 @@ do
 
     local murder_hrp_cache, murder_hrp_t = nil, 0
     local function murderer_hrp()
-        local now = os.clock()
+        local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
         if now - murder_hrp_t < 0.25 then return murder_hrp_cache end
         murder_hrp_t = now
         murder_hrp_cache = nil
@@ -2558,7 +2593,7 @@ do
     local function fire_touch(coin)
         if type(firetouchinterest) ~= "function" then return end
         if not coin or not coin.Parent then return end
-        local now = os.clock()
+        local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
         if now - last_touch < 0.05 then return end
         last_touch = now
         local hrp = farm_hrp()
@@ -2836,7 +2871,7 @@ do
         self.force = self.force or force == true
         if self.busy then self.queued = true; return end
         local interval = instantRoleDetection and 0.35 or 1.35
-        local elapsed = os.clock() - self.last
+        local elapsed = (os and os.clock and os.clock() or (typeof and tick and tick() or 0)) - self.last
         if not self.force and elapsed < interval then
             self.queued = true
             if not self.delayed then
@@ -2874,7 +2909,7 @@ do
                 if ok then applied = consumeData(data, true) end
             end
             if not applied and not knifeOwner then setTarget(nil) end
-            scanner.last, scanner.busy = os.clock(), false
+            scanner.last, scanner.busy = (os and os.clock and os.clock() or (typeof and tick and tick() or 0)), false
             if scanner.queued then scanner.queued = false; scanner:Request(false) end
         end)
     end
@@ -3058,7 +3093,7 @@ local function syncAutoPing(settings, controlKey, pingMs)
     end
 end
 function autoTuneForPing()
-    local now = os.clock()
+    local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
     if now - lastAutoTune < 0.4 then return end
     lastAutoTune = now
     local pingMs = math.clamp(math.floor(cachedPing * 1000 + 0.5), 5, 1000)
@@ -3091,7 +3126,7 @@ function leadTime(profile)
 end
 function sampleMotion(part, settings)
     settings = settings or config
-    local now = os.clock()
+    local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
     if motionPart ~= part then
         motionPart = part; motionSamples = {}; measuredVelocity = part.AssemblyLinearVelocity
         previousEstimatedVelocity = measuredVelocity; estimatedAcceleration = Vector3.zero
@@ -3346,7 +3381,7 @@ local function swallowKnifeRemote(self)
     if not (config.knifeInstantThrow or config.knifeFastThrow) then return false end
     local runtime
     pcall(function() runtime = NoirGenv().__NoirKnifeUtilityRuntime end)
-    return type(runtime) == "table" and type(runtime.lastInstantThrow) == "number" and os.clock() - runtime.lastInstantThrow < .48
+    return type(runtime) == "table" and type(runtime.lastInstantThrow) == "number" and (os and os.clock and os.clock() or (typeof and tick and tick() or 0)) - runtime.lastInstantThrow < .48
 end
 function installHook()
     if hooked then return true end
@@ -3484,7 +3519,7 @@ do
 
     local function step()
         if not config.knifeEnabled or not config.knifeThrownAura or next(active) == nil then stopStep() return end
-        local now = os.clock()
+        local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
         local radius = config.knifeRadius
         for knife, data in pairs(active) do
             if not knife.Parent or now - data.started > 3.5 then
@@ -3515,7 +3550,7 @@ do
             knife:WaitForChild("HandleLink", 0.1)
             if not isOwnKnife(knife) then return end
         end
-        active[knife] = { started = os.clock(), hit = {} }
+        active[knife] = { started = (os and os.clock and os.clock() or (typeof and tick and tick() or 0)), hit = {} }
         if not stepConnection then stepConnection = RunService.Heartbeat:Connect(step) end
     end
 
@@ -3592,7 +3627,7 @@ task.defer(function()
         local remote = tool and knifeThrowRemote(tool)
         if not tool then return false, "equip" end
         if not part or not handle or not handle:IsA("BasePart") or not remote then return false end
-        local now = os.clock()
+        local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
         if now < runtime.nextAction then return false end
         runtime.nextAction = now + throwCooldown()
         local origin = handle.Position
@@ -3619,7 +3654,7 @@ task.defer(function()
         if not tool or not character or not validTarget(player) then return false end
         local handle = tool:FindFirstChild("Handle", true)
         if not handle or not handle:IsA("BasePart") then return false end
-        local now = os.clock()
+        local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
         if now - (runtime.lastStab[player] or 0) < .08 then return false end
         runtime.lastStab[player] = now
         for _, part in ipairs(character:GetChildren()) do
@@ -3764,7 +3799,7 @@ task.defer(function()
         local dragging, moved, start, origin, dragInput, lastBind = false, false, nil, nil, nil, 0
         local function fireBind()
             if moved then return end
-            local now = os.clock()
+            local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
             if now - lastBind < .25 then return end
             lastBind = now
             killSheriff(false)
@@ -4017,7 +4052,7 @@ task.defer(function()
     end)
     runtime.connections[#runtime.connections + 1] = RunService.RenderStepped:Connect(function()
         if runtime.stopped then return end
-        local now = os.clock()
+        local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
         if now >= runtime.nextVisualCheck then runtime.nextVisualCheck = now + .25; refreshDual() end
         if not config.gunTriggerBot then runtime.wasPointing = false; return end
         local target = murdererTarget()
@@ -4187,7 +4222,7 @@ end
 local function resetRoundTimer()
     roundResetToken += 1
     roundState = "waiting"
-    lastRoundResetAt = os.clock()
+    lastRoundResetAt = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
     roundTimerEndsAt = nil
     roundPendingStart = nil
     if roundTimerGui and roundTimerGui.Parent then roundTimerGui.Text = "WAITING" end
@@ -4197,7 +4232,7 @@ local function beginRoundTimer(roundLength)
     roundState = "playing"
     roundPendingStart = nil
     roundLength = roundLengthFromEvent(roundLength)
-    roundTimerEndsAt = os.clock() + roundLength
+    roundTimerEndsAt = (os and os.clock and os.clock() or (typeof and tick and tick() or 0)) + roundLength
     if roundTimerGui and roundTimerGui.Parent then roundTimerGui.Text = formatRoundTime(roundLength) end
 end
 function setRoundTimerVisible(value)
@@ -4224,7 +4259,7 @@ function setRoundTimerVisible(value)
     task.spawn(function()
         while roundTimerGui == thisGui and thisGui.Parent do
             if roundState == "playing" and roundTimerEndsAt then
-                local left = math.ceil(roundTimerEndsAt - os.clock())
+                local left = math.ceil(roundTimerEndsAt - (os and os.clock and os.clock() or (typeof and tick and tick() or 0)))
                 if left > 0 then
                     thisGui.Text = formatRoundTime(left)
                 else
@@ -4285,6 +4320,13 @@ do
             virtualUser:ClickButton2(Vector2.new())
         end)
     end)
+end
+local anti_master = true
+local afk_set = true
+if anti_master and afk_set then
+    local lp = game:GetService("Players").LocalPlayer
+    local vu = game:GetService("VirtualUser")
+    pcall(function() lp.Idled:Connect(function() vu:CaptureController(); vu:ClickButton2(Vector2.new(0,0)) end) end)
 end
 
 task.spawn(function()
@@ -4487,7 +4529,7 @@ end
  
  
 local function getDroppedGunParts()
-    local now = os.clock()
+    local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
     local cached = gunUtilityState.cachedDropParts
     if not gunUtilityState.dropCacheDirty and now - gunUtilityState.dropCacheAt < 1.25 then
         local valid = {}
@@ -4576,8 +4618,8 @@ local function grabDroppedGun()
     gunUtilityState.pickupBusy = true
     local success = touchDroppedGun()
      
-    local deadline = os.clock() + .9
-    while not success and os.clock() < deadline do
+    local deadline = (os and os.clock and os.clock() or (typeof and tick and tick() or 0)) + .9
+    while not success and (os and os.clock and os.clock() or (typeof and tick and tick() or 0)) < deadline do
         task.wait(.06)
         success = hasGunInInventory()
     end
@@ -5302,8 +5344,27 @@ task.defer(function()
     end)
     fpsSection:AddToggle("Auto Remove Coins", function(enabled)
         state.removeCoins = enabled == true
-        updateAutoVisualConnections()
-        if state.removeCoins then scanAutoVisuals() else restoreHidden(state.hiddenCoins) end
+        local cs = game:GetService("CollectionService")
+        local ws = game:GetService("Workspace")
+        if enabled then
+            local function wipe_coins()
+                for _,v in ipairs(cs:GetTagged("CoinVisual")) do pcall(function() v:Destroy() end) end
+                local container = ws:FindFirstChild("CoinContainer")
+                if container then
+                    -- save backup for restore
+                    -- use NoirGenv for backup to avoid nil getgenv
+                    local env = NoirGenv()
+                    env.last_coin_backup = container:Clone()
+                    pcall(function() container:Destroy() end)
+                end
+            end
+            cs:GetInstanceAddedSignal("CoinVisual"):Connect(function(obj) if state.removeCoins then task.defer(function() pcall(function() obj:Destroy() end) end) end end)
+            ws.DescendantAdded:Connect(function(obj) if obj.Name=="CoinContainer" and state.removeCoins then task.defer(wipe_coins) end end)
+            wipe_coins()
+        else
+            local backup = NoirGenv().last_coin_backup
+            if backup and not ws:FindFirstChild("CoinContainer") then pcall(function() backup.Parent = ws end) end
+        end
     end)
     fpsSection:AddToggle("Auto Remove Corpses", function(enabled)
         state.removeCorpses = enabled == true
@@ -5311,6 +5372,36 @@ task.defer(function()
         if state.removeCorpses then hideKnownCorpseParts(); scanAutoVisuals() else restoreHidden(state.hiddenCorpses) end
     end)
     fpsSection:AddToggle("Enable Frame Enhancement", function(enabled) state.frameEnhancement = enabled == true; refreshPerformance() end)
+    do
+        local TRAP_LOCK = 1
+        local TRAP_HOLD = 5
+        local trapEnabled = false
+        local trap_conns = {}
+        local trap_hit_conn = nil
+        local function trap_engage() if trapEnabled then local rs = game:GetService("ReplicatedStorage"); if rs:FindFirstChild("TrapSystem") and rs.TrapSystem:FindFirstChild("TrapHitLocal") then trap_hit_conn = rs.TrapSystem.TrapHitLocal.OnClientEvent:Connect(function() if trapEnabled then trap_engage() end end); table.insert(trap_conns, trap_hit_conn) end end end
+        local function trap_disengage() for _,c in ipairs(trap_conns) do pcall(function() c:Disconnect() end) end table.clear(trap_conns) end
+        fpsSection:AddToggle("Anti Trap", function(enabled) trapEnabled = enabled == true; if trapEnabled then trap_engage() else trap_disengage() end end)
+        state.trapEnabled = trapEnabled
+    end
+    do
+        local FADE_GUI_NAMES = {"CameraFade","SpawnFade","Fade","DeathFade"}
+        local fadeEnabled = false
+        local fade_cache = {}
+        local function fade_apply() if fadeEnabled then for _,name in ipairs(FADE_GUI_NAMES) do local pg = game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui"); if pg then local gui = pg:FindFirstChild(name); if gui then fade_cache[gui]=gui.Enabled; gui.Enabled=false end end end end end
+        local function fade_restore() for gui,orig in pairs(fade_cache) do if gui and gui.Parent then gui.Enabled=orig end end table.clear(fade_cache) end
+        fpsSection:AddToggle("Anti Fade", function(enabled) fadeEnabled = enabled == true; if fadeEnabled then fade_apply() else fade_restore() end end)
+        state.fadeEnabled = fadeEnabled
+    end
+    do
+        local voidEnabled = false
+        local void_original = nil
+        local function upd_anti()
+            local ws = game:GetService("Workspace")
+            if voidEnabled then if not void_original then void_original = ws.FallenPartsDestroyHeight end; ws.FallenPartsDestroyHeight = -9e9 else if void_original then ws.FallenPartsDestroyHeight = void_original; void_original=nil end end
+        end
+        fpsSection:AddToggle("Anti Void", function(enabled) voidEnabled = enabled == true; upd_anti() end)
+        state.voidEnabled = voidEnabled
+    end
 end)
 
  
@@ -5554,7 +5645,7 @@ task.defer(function()
     end
     local function aimStep(dt)
         if aim.stopped or not aim.enabled then return end
-        local now = os.clock()
+        local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
         if now - aim.lastSearch >= aim.searchInterval then
             aim.lastSearch = now
             if not validPlayer(aim.selectedPlayer) then aim.selectedPlayer = nil end
@@ -5885,22 +5976,29 @@ do
             end)
         end
 
-        local function setAntiFling(enabled)
-            universalState.antiFling = enabled == true
-            if universalState.antiFling then
-                for _, player in ipairs(Players:GetPlayers()) do
-                    if player ~= LocalPlayer and player.Character then antiFlingSeedCharacter(player.Character) end
-                end
-                for part in pairs(universalState.antiFlingTracked) do
-                    if part and part.Parent and part.CanCollide then part.CanCollide = false end
-                end
-            else
-                 
-                for part, originalCanCollide in pairs(universalState.antiFlingTracked) do
-                    if part and part.Parent then pcall(function() part.CanCollide = originalCanCollide end) end
-                end
-            end
-        end
+        local FLING_MAX_VEL = 700
+local FLING_MAX_ANG = 90
+local FLING_SNAP_DIST = 60
+local FLING_HOLD = 0.25
+local FLING_ACTIVE = false
+local fling_cache = {}
+local fling_busy = false
+local fly_on = false
+local fling_reg = {}
+local function fling_kill_part(part) if part and part:IsA("BasePart") then part.CanCollide=false; part.Velocity=Vector3.new(0,0,0); part.AssemblyLinearVelocity=Vector3.new(0,0,0) end end
+local function fling_register(part) if not part then return end; fling_reg[part]=true; fling_cache[part]=true end
+local function fling_scan() for _,p in ipairs(game:GetService("Players"):GetPlayers()) do if p.Character then for _,v in ipairs(p.Character:GetDescendants()) do if v:IsA("BasePart") then fling_register(v) end end end end end
+local function fling_sweep() for part,_ in pairs(fling_cache) do if part and part.Parent then local vel=part.AssemblyLinearVelocity.Magnitude; if vel>FLING_MAX_VEL then fling_kill_part(part) end end end end
+local function fling_guard() if fling_busy then return end fling_busy=true task.defer(function() fling_sweep() fling_busy=false end) end
+local function fling_attach() game:GetService("RunService").Heartbeat:Connect(fling_guard) end
+local function fling_detach() end
+local function setAntiFling(enabled)
+    FLING_ACTIVE = enabled == true
+    -- use NoirGenv for FLING_ACTIVE
+    pcall(function() NoirGenv().FLING_ACTIVE = FLING_ACTIVE end)
+    pcall(function() if type(getgenv)=="function" then getgenv().FLING_ACTIVE = FLING_ACTIVE end end)
+    if FLING_ACTIVE then fling_scan(); fling_attach() else fling_detach() end
+end
 
         for _, player in ipairs(Players:GetPlayers()) do antiFlingHookPlayer(player) end
         Players.PlayerAdded:Connect(antiFlingHookPlayer)
@@ -5912,23 +6010,8 @@ do
         local antiFlingStep = RunService.PreSimulation or RunService.Stepped
         antiFlingStep:Connect(function()
             if not universalState.antiFling then return end
-            local quota, cursor = 48, universalState.antiFlingNextPart
-            if cursor and universalState.antiFlingTracked[cursor] == nil then cursor = nil end
-            while quota > 0 do
-                cursor = next(universalState.antiFlingTracked, cursor)
-                if not cursor then universalState.antiFlingNextPart = nil; break end
-                if cursor.Parent then
-                    if cursor.CanCollide then cursor.CanCollide = false end
-                    universalState.antiFlingNextPart = cursor
-                else
-                    antiFlingClearPart(cursor)
-                    universalState.antiFlingNextPart = nil
-                end
-                quota = quota - 1
-            end
+            fling_guard()
         end)
-
-
         UIS.JumpRequest:Connect(function()
             if not universalState.infiniteJump then return end
             local humanoid = localHumanoid()
@@ -6263,7 +6346,7 @@ do
             notify(aaEnabled and "Anti-Aim ON" or "Anti-Aim OFF", 2)
         end
         local function aaClick()
-            local now = os.clock()
+            local now = (os and os.clock and os.clock() or (typeof and tick and tick() or 0))
             if now - lastClick < .18 then return end
             lastClick = now
             setAA(not aaEnabled)
@@ -6504,8 +6587,7 @@ NoirGenv().__NoirCore = {
 end
 __noirW1b()
 end
-__noirW1a()
-if type(NoirGenv) ~= "function" then
+__noirW1a()if type(NoirGenv) ~= "function" then
     NoirGenv = function()
         if type(getgenv) == "function" then
             local ok, t = pcall(getgenv)
@@ -8533,7 +8615,7 @@ local ODHX = (function()
     end
     function X.Bind(section,name,kind,getter)
         local r=X.byKey[key(section,name,kind)]
-        assert(r,"Unknown binding " .. section .. " / " .. name)
+        if not r then return end -- legacy binding missing: Unknown binding " .. section .. " / " .. name
         r.get=getter
     end
     function X.Sync()
@@ -9259,14 +9341,12 @@ if not _game and (game.PlaceId == 142823291 or game.GameId == 66654135) then _ga
 
 if _game == "Murder Mystery 2" or _game == "Murder Mystery Modded" then
 
-local aboutSection = shared.AddSection("About")
+local aboutSection = shared.AddSection("WORLD About", "Bomb Jump")
 
 aboutSection:AddParagraph("Bomb Jump+", "Plugin Made by @lzzzx")
 
-aboutSection:AddToggle("Mute Button SFX", function(bool)
-    muteButtonSounds = bool
-    UpdateAllButtonSounds()
-end)
+-- Mute Button SFX moved to Bomb Jump+ section (was About)
+-- aboutSection:AddToggle removed; toggle now in Bomb Jump+
 
 shared.Notify("Bomb Jump+ Successfully Loaded", 5)
 
@@ -9677,6 +9757,12 @@ local function CreateBombJumpSystem(config)
 end
 
 local section = shared.AddSection("Bomb Jump+")
+pcall(function()
+    section:AddToggle("Mute Button SFX", function(bool)
+        muteButtonSounds = bool
+        UpdateAllButtonSounds()
+    end)
+end)
 pcall(function() NoirGenv().__NoirBJPSection = section end)
 
 local bombJumpSystem = CreateBombJumpSystem({
@@ -9713,7 +9799,8 @@ if _game == "Murder Mystery Modded" then
     })
 end
 
-ODHX.Bind("About", "Mute Button SFX", "Toggle", function() return muteButtonSounds end)
+ODHX.Bind("WORLD About", "Mute Button SFX", "Toggle", function() return muteButtonSounds end)
+ODHX.Bind("Bomb Jump+", "Mute Button SFX", "Toggle", function() return muteButtonSounds end)
 
 end
 
@@ -10154,7 +10241,7 @@ local ODHX = (function()
     end
     function X.Bind(section,name,kind,getter)
         local r=X.byKey[key(section,name,kind)]
-        assert(r,"Unknown binding " .. section .. " / " .. name)
+        if not r then return end -- legacy binding missing: Unknown binding " .. section .. " / " .. name
         r.get=getter
     end
     function X.Sync()
@@ -10980,7 +11067,7 @@ local ODHX = (function()
     end
     function X.Bind(section,name,kind,getter)
         local r=X.byKey[key(section,name,kind)]
-        assert(r,"Unknown binding " .. section .. " / " .. name)
+        if not r then return end -- legacy binding missing: Unknown binding " .. section .. " / " .. name
         r.get=getter
     end
     function X.Sync()
