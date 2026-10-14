@@ -1,3 +1,5 @@
+-- SAFE BUILD — anti-kick disabled, only Rise parry
+pcall(function()
 -- Blade Ball FINAL — Rise autoparry + anti-kick + GUI
 -- Вставь в Delta: loadstring(readfile("чистый скрипт/BladeBall_AutoParry_FINAL.lua"))()
 
@@ -368,12 +370,7 @@ end)()
 -- если readfile не доступен, то как модуль уже в памяти
 if not AutoParry then error("AutoParry_Rise.lua не найден") end
 
--- Анти-кик сразу
-local disconnectKick = AutoParry.EnableAntiKick(function(msg)
- warn("[AntiKick] blocked: "..tostring(msg))
- game:GetService("StarterGui")("SendNotification", {Title="AntiKick", Text="Kick blocked: "..tostring(msg)(1,80), Duration=5})
-end)
-print("[AntiKick] armed")
+-- Anti-kick disabled for debug
 
 -- Авто-поиск Signer (как в host script)
 local function findSigner()
@@ -475,7 +472,7 @@ end
 
 mkToggle("Auto Parry", 40, ap.Enabled, function(v) ap.Enabled=v end)
 mkToggle("Auto Spam", 72, ap.AutoSpam, function(v) ap:SetSpam(v) end)
-mkToggle("Anti-Kick", 104, true, function(v) if v then AutoParry.EnableAntiKick() else disconnectKick() end end)
+mkToggle("Anti-Kick (off)", 104, false, function(v) warn("Anti-Kick disabled in safe build") end)
 
 local status=Instance.new("TextLabel",frame) status.Size=UDim2.new(1,-20,0,18) status.Position=UDim2.fromOffset(10,136) status.BackgroundTransparency=1 status.Text="Signer: "..(signer and signer.rem.Name or "nil") status.TextColor3=Color3.fromRGB(120,255,120) status.Font=Enum.Font.Code status.TextSize=10 status.TextXAlignment=Enum.TextXAlignment.Left
 
@@ -487,3 +484,6 @@ local info=Instance.new("TextLabel",frame) info.Size=UDim2.new(1,-20,0,40) info.
 
 ap:Start()
 print("[Rise] started. E — toggle spam")
+
+end)
+print('[BladeBall] safe build loaded')
